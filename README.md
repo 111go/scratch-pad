@@ -1,6 +1,8 @@
 # scratch-pad
 Starting out 
 
-## Day 1 - 02/06/2026
+## Math
 
-01. Started Machine Learning Specialization by DeepLearning.AI and Standford Online
+**Tier 1 (Foundation)**: Linear Algebra, Calculus, Probability & Statistics, Discrete Math
+**Tier 2 (Core AI/ML)**: Optimization Theory, Information Theory, Numerical Analysis
+**Tier 3 (Advanced/Specialized)**: Graph Theory, Abstract Algebra, Differential Geometry/Topology
