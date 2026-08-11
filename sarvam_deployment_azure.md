@@ -6,7 +6,7 @@ Dev/test deployment of [Sarvam-30B](https://www.sarvam.ai/blogs/sarvam-30b-105b)
 
 | Component | Status |
 |---|---|
-| Model weights | Official GGUF at [`sarvamai/sarvam-30b-gguf`](https://huggingface.co/sarvamai/sarvam-30b-gguf) — `sarvam-30b-Q4_K_M.gguf` (~19.6 GB) |
+| Model weights | Official GGUF at [`sarvamai/sarvam-30b-gguf`](https://huggingface.co/sarvamai/sarvam-30b-gguf) — split into 6 shards, `sarvam-30b-Q4_K_M.gguf-0000{1..6}-of-00006.gguf` (~19.6 GB total). llama.cpp natively loads all shards when pointed at the first one. |
 | llama.cpp support | `sarvam_moe` architecture merged mainline via [PR #20275](https://github.com/ggml-org/llama.cpp/pull/20275), shipped in release `b9093` (~May 2026). Any current build works — no fork/patch needed. |
 | Compute target | An [Azure ML compute instance](https://learn.microsoft.com/en-us/azure/machine-learning/concept-compute-instance?view=azureml-api-2) is a fully managed, single-node Ubuntu VM with root/terminal access and broad Azure VM SKU support — you can build and run arbitrary binaries on it, including llama.cpp. |
 
@@ -19,6 +19,7 @@ Because it's a Mixture-of-Experts model, all 128 experts must be resident in mem
 - An existing Azure ML workspace.
 - Quota for the `standardDDSv5` (or `standardEDSv5`) VM family in your target region.
 - Outbound internet access from the compute instance (to reach GitHub and Hugging Face during setup) — if your workspace is VNet-isolated with restricted egress, allow those endpoints or pre-stage the files.
+- A Hugging Face account and a **read-scoped** access token (huggingface.co/settings/tokens). Hugging Face now requires authentication for most downloads, even from public/permissively-licensed repos like this one.
 
 ## VM sizing
 
@@ -36,8 +37,8 @@ Azure VM **temp/local disk (`/mnt`) is not guaranteed to survive stop/deallocate
 
 ```
 /home/azureuser/sarvam/
-├── llama.cpp/build/bin/llama-server   # built once
-└── models/sarvam-30b-Q4_K_M.gguf      # downloaded once
+├── llama.cpp/build/bin/llama-server                        # built once
+└── models/sarvam-30b-Q4_K_M.gguf-0000{1..6}-of-00006.gguf   # 6 shards, downloaded once
 ```
 
 ## Setup mechanism
@@ -94,12 +95,22 @@ pip install --user -U "huggingface_hub[cli]"
 # support). A fresh clone of main is fine as of Aug 2026.
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-cmake -B build -DGGML_NATIVE=ON -DGGML_OPENMP=ON
+# Tests/examples aren't needed to run llama-server/llama-cli (both live under
+# tools/) and skipping them shortens the build considerably.
+cmake -B build -DGGML_NATIVE=ON -DGGML_OPENMP=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
 cmake --build build --config Release -j"$(nproc)"
 
 mkdir -p "$SARVAM_HOME/models"
-"$HOME/.local/bin/huggingface-cli" download sarvamai/sarvam-30b-gguf \
-  sarvam-30b-Q4_K_M.gguf \
+# Hugging Face requires an authenticated token for most downloads now, even on
+# public/Apache-2.0 repos like this one, and this script runs unattended (no
+# human to answer an interactive `hf auth login` prompt). Use a READ-ONLY
+# token, never commit the filled-in script to source control, and consider
+# revoking/rotating the token once setup completes. If you'd rather not embed
+# a credential at all, pre-stage the 6 shards in the workspace's default
+# datastore instead and swap this for a copy step (see Prerequisites).
+export HF_TOKEN="<your-read-only-hf-token>"
+"$HOME/.local/bin/hf" download sarvamai/sarvam-30b-gguf \
+  --include "sarvam-30b-Q4_K_M.gguf-*-of-00006.gguf" \
   --local-dir "$SARVAM_HOME/models"
 EOF
 
@@ -114,15 +125,11 @@ Wants=network-online.target
 Type=simple
 User=azureuser
 WorkingDirectory=/home/azureuser/sarvam
-ExecStart=/bin/bash -c '/home/azureuser/sarvam/llama.cpp/build/bin/llama-server \
-  -m /home/azureuser/sarvam/models/sarvam-30b-Q4_K_M.gguf \
-  -t $(nproc) \
-  -c 8192 \
-  --mlock \
-  --host 127.0.0.1 --port 8080'
+ExecStart=/bin/bash -c '/home/azureuser/sarvam/llama.cpp/build/bin/llama-server -m /home/azureuser/sarvam/models/sarvam-30b-Q4_K_M.gguf-00001-of-00006.gguf -t $(nproc) -c 8192 --mlock --host 127.0.0.1 --port 8080'
 Restart=on-failure
 RestartSec=5
 OOMScoreAdjust=-500
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -151,19 +158,17 @@ Wants=network-online.target
 Type=simple
 User=azureuser
 WorkingDirectory=/home/azureuser/sarvam
-ExecStart=/bin/bash -c '/home/azureuser/sarvam/llama.cpp/build/bin/llama-server \
-  -m /home/azureuser/sarvam/models/sarvam-30b-Q4_K_M.gguf \
-  -t $(nproc) \
-  -c 8192 \
-  --mlock \
-  --host 127.0.0.1 --port 8080'
+ExecStart=/bin/bash -c '/home/azureuser/sarvam/llama.cpp/build/bin/llama-server -m /home/azureuser/sarvam/models/sarvam-30b-Q4_K_M.gguf-00001-of-00006.gguf -t $(nproc) -c 8192 --mlock --host 127.0.0.1 --port 8080'
 Restart=on-failure
 RestartSec=5
 OOMScoreAdjust=-500
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+`LimitMEMLOCK=infinity` is required for `--mlock` to actually work — systemd's default `RLIMIT_MEMLOCK` (often 64 KiB) is far too small to lock a ~20 GB model into RAM, so without this the flag silently does nothing.
 
 `--host 127.0.0.1` keeps the server reachable only from inside the instance (via terminal, SSH tunnel, or Jupyter proxy) since compute instances aren't meant to be public-internet-facing. Change to `--host 0.0.0.0` only if you need other hosts in the same VNet to reach it, and lock that down with an NSG rule for port 8080.
 
@@ -174,7 +179,7 @@ Runs on every start, including once right after the creation script during initi
 #!/bin/bash
 set -euo pipefail
 
-MODEL=/home/azureuser/sarvam/models/sarvam-30b-Q4_K_M.gguf
+MODEL=/home/azureuser/sarvam/models/sarvam-30b-Q4_K_M.gguf-00001-of-00006.gguf
 BIN=/home/azureuser/sarvam/llama.cpp/build/bin/llama-server
 
 if [[ ! -f "$MODEL" || ! -x "$BIN" ]]; then
@@ -192,6 +197,21 @@ systemctl enable --now sarvam-llama.service
 systemctl --no-pager status sarvam-llama.service
 ```
 
+### Manual recovery / interactive debugging
+
+If something needs fixing by hand from the instance's own terminal (Studio → Compute → your instance → **Terminal**), a few things are easy to trip over:
+
+- **The terminal logs you in as `azureuser`, not root.** Writing `/etc/systemd/system/*.service` or running `systemctl enable` needs an actual root shell: run `sudo -i` (prompt becomes `root@...#`). Do **not** run `sudo -u azureuser -i` for this — that re-authenticates as the *same* non-root user and silently no-ops, leaving you exactly where you started (`Permission denied` / `Interactive authentication required` on the next command).
+- **Paste multi-line commands carefully.** Trailing `\` line-continuations can get stripped in transit depending on the terminal/clipboard path, which silently corrupts the result: a mangled systemd unit fails with `bad unit file setting`, a mangled multi-line `curl` throws `-H: command not found`. Prefer single-line versions when pasting interactively — every code block in this doc that's meant to be pasted as-is (the systemd unit, the verification `curl` below) is already single-line for this reason.
+- **If `sarvam-setup.service` exits `status=1` with no error text anywhere** — `journalctl -u sarvam-setup`, `dmesg -T | grep -i oom`, and `journalctl -u systemd-oomd` all come up clean — it's most likely a transient kill during the build rather than a real bug. Resume it manually; the build is incremental and normally finishes in under a minute:
+  ```
+  sudo -u azureuser -i
+  cd ~/sarvam/llama.cpp
+  cmake --build build --config Release -j$(nproc)
+  ```
+  Then finish the steps `sarvam-setup.sh` never reached — the model download (with `HF_TOKEN` exported, see `creation-script.sh` above) and the systemd unit install/enable block, both reproduced above.
+- **To confirm the *right* model is actually loaded** (not just that a process is listening): check `journalctl -u sarvam-llama` for `sarvam_moe` and a 128-expert count in the startup log, hit `curl -s http://127.0.0.1:8080/props` (reports the `model_path` it's actually serving), or dump the GGUF header directly — `llama-gguf`/`gguf-dump` from the build read `general.name`/`general.architecture` straight from the file, independent of what the server reports.
+
 ## Verification
 
 From the compute instance's own terminal (Studio → Compute → your instance → **Terminal**):
@@ -203,9 +223,8 @@ curl -s http://127.0.0.1:8080/health
 # 2. Indic-language smoke test — this is the meaningful check, since the
 #    sarvam_moe llama.cpp support went through a documented tokenizer fix
 #    for Indic-script parity (SPM-style BPE vs GPT-2 byte-level).
-curl -s http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"नमस्ते, आप कैसे हैं?"}]}'
+#    Kept on one line deliberately — see "Manual recovery" above on why.
+curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"नमस्ते, आप कैसे हैं?"}]}'
 
 # 3. Service status / logs
 systemctl status sarvam-llama.service
@@ -214,6 +233,8 @@ journalctl -u sarvam-llama -f
 
 Confirm the response is coherent Devanagari text, not garbled tokens — that's the signal the architecture/tokenizer support is actually working, not just that a process is listening.
 
+On CPU-only inference, expect roughly **10–60s** end-to-end for a short prompt like the one above on `Standard_D16ds_v5`: prompt processing is near-instant, and generation typically runs 5–20 tokens/sec across 16 vCPUs depending on reply length. To confirm it's actively working rather than stuck, watch `top` in a second terminal session — `llama-server` should show CPU usage near `1600%` (all cores) while generating.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -221,6 +242,10 @@ Confirm the response is coherent Devanagari text, not garbled tokens — that's 
 | Creation script times out | Model download exceeded 15-min default | Set `DURATION=60m` (or higher) on the creation script |
 | Compute instance shows **"Create failed"**, but the setup-script logs themselves show no error | Startup script ran right after the creation script (as it does on initial provisioning) and exited 1 because `sarvam-setup`'s build/download was still in progress — the file checks in `startup-script.sh` predate that guard | Confirmed fixed by the `systemctl is-active --quiet sarvam-setup` check now in `startup-script.sh` above; if you're on an older copy of the script, update it and recreate the instance |
 | `unknown model architecture 'sarvam_moe'` | llama.cpp built before release `b9093` | `cd ~/sarvam/llama.cpp && git pull && cmake --build build -j$(nproc)` |
+| `hf download` prompts for a token, or fails with a 401 | Hugging Face requires auth for downloads now, even on public repos | Generate a read-scoped token and `export HF_TOKEN=...` before downloading (see Prerequisites / `creation-script.sh`) |
+| `hf download ...` errors with "file not found in the repository" | Wrong filename — the model ships as 6 shards (`sarvam-30b-Q4_K_M.gguf-0000N-of-00006.gguf`), never as one file | Use `--include "sarvam-30b-Q4_K_M.gguf-*-of-00006.gguf"`; point `llama-server -m` at shard `00001`, llama.cpp auto-loads the rest |
+| `sarvam-setup.service` exits `status=1`, but no error text anywhere in the logs | Likely a transient kill during the build (OOM, disk-full, and reboot were all ruled out in one observed case) | Resume manually — see "Manual recovery / interactive debugging" above; the incremental build usually completes cleanly on retry |
+| Editing `sarvam-llama.service` by hand fails to start with `bad unit file setting` | A pasted multi-line `ExecStart=...\` had its trailing backslashes stripped in transit, splitting one directive into several invalid lines | Use the single-line `ExecStart=` form already in this doc; avoid re-wrapping it across lines when copying |
 | Service fails with OOM / gets killed | RAM too tight for chosen SKU + context size | Move to `Standard_E32ds_v5`, or lower `-c` (context size) |
 | `/health` never returns 200 | Model still loading (large mmap) | Wait — a 20 GB weight file can take a minute-plus to page in on first request; check `journalctl -u sarvam-llama` for progress |
 | Root disk filling up | 120 GB OS disk cap; build artifacts + weights + Ubuntu base | `df -h`; clear at least 5 GB before rebooting per Microsoft's compute-instance guidance, or move to a SKU that supports an attached data disk |
