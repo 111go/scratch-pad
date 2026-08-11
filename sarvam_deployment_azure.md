@@ -52,7 +52,7 @@ Azure ML compute instances support two kinds of [setup scripts](https://learn.mi
 1. In [ml.azure.com](https://ml.azure.com) → your workspace → **Notebooks**, upload `creation-script.sh` and `startup-script.sh` (below) — filenames must end in `.sh`.
 2. **Compute** → **+New** → choose the VM size (`Standard_D32ds_v5`).
 3. On the **Applications** step of the creation form, toggle on both **creation script** and **startup script**, and browse to the two uploaded files.
-4. Since the model download can take a while, override the default 15-minute setup-script timeout: set `DURATION=60m` (available as an ARM template / advanced-settings parameter on the creation script).
+4. The default setup-script timeout is 15 minutes, and Azure ML caps the override at **25 minutes max** — not enough to reliably fit the llama.cpp build plus a ~20 GB weight download. Set `DURATION=25m` (the ceiling; available as an ARM template / advanced-settings parameter on the creation script), and rely on the creation script backgrounding the actual work (below) rather than the timeout to cover it.
 5. Create the instance. Watch progress under the instance's **Logs** tab (setup script output is mirrored to the Notebooks file share under `Logs/<compute-instance-name>`).
 
 > CLI/YAML note: `az ml compute create` also supports a `setup_scripts` block in the compute-instance YAML, but the exact field syntax varies by CLI version — check `az ml compute create -h` and the `computeInstance.schema.json` for your installed extension before scripting this end-to-end. The Studio flow above is the verified path.
@@ -60,16 +60,24 @@ Azure ML compute instances support two kinds of [setup scripts](https://learn.mi
 ## Scripts
 
 ### `creation-script.sh`
-Runs once. Installs build deps, builds llama.cpp, downloads the weights, installs and starts the systemd service.
+Runs once. Installs build deps, then hands the build + download off to a **detached systemd unit** so the real work keeps running after this script's own process — and its 25-minute cap — exits.
 
 ```bash
 #!/bin/bash
 set -euo pipefail
 
 # Runs once, as root, when the compute instance is created.
+# NOTE: this script itself must return well within Azure ML's 25-minute
+# creation-script cap. The build + ~20 GB download won't reliably fit in
+# that window, so the actual work is launched as a transient systemd unit
+# (systemd-run --collect) that survives past this script's exit.
 
 apt-get update
 apt-get install -y --no-install-recommends build-essential cmake git python3-pip
+
+cat > /usr/local/bin/sarvam-setup.sh <<'SETUP'
+#!/bin/bash
+set -euo pipefail
 
 # Everything under /home/azureuser must be owned by azureuser, and pip/hf
 # downloads should land in that user's environment.
@@ -122,6 +130,12 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now sarvam-llama.service
+SETUP
+chmod +x /usr/local/bin/sarvam-setup.sh
+
+# --collect cleans up the transient unit once it exits; the unit's own log
+# stays queryable via `journalctl -u sarvam-setup` (see Troubleshooting).
+systemd-run --unit=sarvam-setup --collect /usr/local/bin/sarvam-setup.sh
 ```
 
 ### `sarvam-llama.service`
@@ -154,7 +168,7 @@ WantedBy=multi-user.target
 `--host 127.0.0.1` keeps the server reachable only from inside the instance (via terminal, SSH tunnel, or Jupyter proxy) since compute instances aren't meant to be public-internet-facing. Change to `--host 0.0.0.0` only if you need other hosts in the same VNet to reach it, and lock that down with an NSG rule for port 8080.
 
 ### `startup-script.sh`
-Runs on every start. `systemctl enable` already makes the service auto-start on boot, but this is a safety net that fails loudly if the OS-disk artifacts are somehow missing.
+Runs on every start, including once right after the creation script during initial provisioning — at that point the creation script's background build/download (`sarvam-setup`, a detached `systemd-run` unit, see above) is normally still in progress, so the model/binary won't exist yet. The script must tell that apart from a genuine failure: it checks whether `sarvam-setup` is still running before treating missing artifacts as an error, otherwise a non-zero exit here gets reported as a **compute-instance creation failure** even though the build is proceeding normally in the background.
 
 ```bash
 #!/bin/bash
@@ -164,8 +178,12 @@ MODEL=/home/azureuser/sarvam/models/sarvam-30b-Q4_K_M.gguf
 BIN=/home/azureuser/sarvam/llama.cpp/build/bin/llama-server
 
 if [[ ! -f "$MODEL" || ! -x "$BIN" ]]; then
-  echo "ERROR: sarvam-llama prerequisites missing ($MODEL or $BIN not found)." \
-       "Re-run the creation script." >&2
+  if systemctl is-active --quiet sarvam-setup; then
+    echo "sarvam-setup is still building/downloading — will be picked up on next start." >&2
+    exit 0
+  fi
+  echo "ERROR: sarvam-llama prerequisites missing ($MODEL or $BIN not found)," \
+       "and sarvam-setup is not running. Re-run the creation script." >&2
   exit 1
 fi
 
@@ -201,6 +219,7 @@ Confirm the response is coherent Devanagari text, not garbled tokens — that's 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Creation script times out | Model download exceeded 15-min default | Set `DURATION=60m` (or higher) on the creation script |
+| Compute instance shows **"Create failed"**, but the setup-script logs themselves show no error | Startup script ran right after the creation script (as it does on initial provisioning) and exited 1 because `sarvam-setup`'s build/download was still in progress — the file checks in `startup-script.sh` predate that guard | Confirmed fixed by the `systemctl is-active --quiet sarvam-setup` check now in `startup-script.sh` above; if you're on an older copy of the script, update it and recreate the instance |
 | `unknown model architecture 'sarvam_moe'` | llama.cpp built before release `b9093` | `cd ~/sarvam/llama.cpp && git pull && cmake --build build -j$(nproc)` |
 | Service fails with OOM / gets killed | RAM too tight for chosen SKU + context size | Move to `Standard_E32ds_v5`, or lower `-c` (context size) |
 | `/health` never returns 200 | Model still loading (large mmap) | Wait — a 20 GB weight file can take a minute-plus to page in on first request; check `journalctl -u sarvam-llama` for progress |
